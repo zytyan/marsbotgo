@@ -1,0 +1,25 @@
+version: "2"
+plugins:
+- name: mygen
+  wasm:
+    url: file://sql/plugins/sqlc-gen-go.wasm
+    sha256: "e899a4af7484bb2d89deb5951a35ac05a354d3e086f76a152e1317ccf7349601"
+sql:
+  - engine: "sqlite"
+    queries:
+      - "sql/query_mars.sql"
+    schema:
+      - "sql/schema_mars.sql"
+    codegen:
+    - out: q
+      plugin: mygen
+      options:
+        package: "q"
+        out: "q"
+        output_files_suffix: "_gen"
+        output_db_file_name: "db_gen.go"
+        output_models_file_name: "models_gen.go"
+        output_querier_file_name: "querier_gen.go"
+        emit_json_tags: true
+        query_parameter_limit: 4
+        emit_prepared_queries: true
