@@ -321,7 +321,7 @@ func (q *Queries) ListMarsInfoByGroup(ctx context.Context, groupID int64) ([]Mar
 
 const listSimilarPhotos = `-- name: ListSimilarPhotos :many
 SELECT mars_info.group_id, mars_info.pic_dhash, mars_info.count, mars_info.last_msg_id, mars_info.in_whitelist,
-       hamming_distance(pic_dhash, CAST(? AS BLOB)) AS hd
+       CAST(hamming_distance(pic_dhash, CAST(? AS BLOB)) AS INTEGER) AS hd
 FROM mars_info
 WHERE group_id = ?
   AND hd < CAST(? AS INTEGER)
@@ -330,8 +330,8 @@ LIMIT 10
 `
 
 type ListSimilarPhotosRow struct {
-	MarsInfo MarsInfo    `json:"mars_info"`
-	Hd       interface{} `json:"hd"`
+	MarsInfo MarsInfo `json:"mars_info"`
+	Hd       int64    `json:"hd"`
 }
 
 func (q *Queries) ListSimilarPhotos(ctx context.Context, srcDhash []byte, groupID int64, minDistance int64) ([]ListSimilarPhotosRow, error) {

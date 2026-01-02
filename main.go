@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,26 +40,35 @@ type Config struct {
 	ReportStatUrl string `env:"MARS_REPORT_STAT_URL"`
 	LogLevel      string `env:"LOG_LEVEL" envDefault:"INFO"`
 
-	BotBaseUrl     string `env:"BOT_BASE_URL"`
-	BotBaseFileUrl string `env:"BOT_BASE_FILE_URL"`
-	BotProxy       string `env:"BOT_PROXY"`
+	BotBaseUrl     string   `env:"BOT_BASE_URL"`
+	BotBaseFileUrl string   `env:"BOT_BASE_FILE_URL"`
+	BotProxy       *url.URL `env:"BOT_PROXY"`
 
 	S3ApiEndpoint   string `env:"S3_API_ENDPOINT"`
 	S3ApiKeyID      string `env:"S3_API_KEY_ID"`
 	S3ApiKeySecret  string `env:"S3_API_KEY_SECRET"`
 	S3Bucket        string `env:"S3_BUCKET"`
-	S3BackupMinutes int    `env:"BACKUP_INTERVAL_MINUTES"`
+	S3BackupMinutes int    `env:"BACKUP_INTERVAL_MINUTES" envDefault:"2880"`
+
+	DevMode bool `env:"DEV_MODE" envDefault:"false"`
 }
 
-var config = env.Must(env.ParseAs[Config]())
+var config Config
 
 const (
-	sqliteDriverName     = "marsbot_sqlite"
-	groupedMediaWait     = 1500 * time.Millisecond
-	mediaGroupLimit      = 10
-	similarHDThreshold   = 6
-	exportCooldown       = 10 * time.Minute
-	hammingDistanceError = "dhash length mismatch"
+	sqliteDriverName           = "marsbot_sqlite"
+	groupedMediaWait           = 1500 * time.Millisecond
+	mediaGroupLimit            = 10
+	similarHDThreshold   int64 = 6
+	exportCooldown             = 10 * time.Minute
+	hammingDistanceError       = "dhash length mismatch"
+
+	botRequestTimeout    = 15 * time.Second
+	fileDownloadTimeout  = 20 * time.Second
+	reportRequestTimeout = 10 * time.Second
+	reportStatTimeout    = 5 * time.Second
+
+	hammdistSOName = "hammdist_c/libhammdist.so"
 )
 
 var registerSQLiteOnce sync.Once
@@ -98,6 +106,11 @@ type App struct {
 }
 
 func main() {
+	err := env.Parse(&config)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(2)
+	}
 	logger, err := buildLogger(config.LogLevel)
 	if err != nil {
 		panic(err)
@@ -155,6 +168,9 @@ func buildApp(logger *zap.Logger) (*App, *ext.Updater, error) {
 			logger.Warn("handler error", zap.Error(err))
 			return ext.DispatcherActionNoop
 		},
+		Panic: func(b *gotgbot.Bot, ctx *ext.Context, r interface{}) {
+			logger.Error("handler panic", zap.Any("r", r), zap.Stack("stack"))
+		},
 	})
 	app.registerHandlers(dispatcher)
 	updater := ext.NewUpdater(dispatcher, nil)
@@ -162,7 +178,13 @@ func buildApp(logger *zap.Logger) (*App, *ext.Updater, error) {
 }
 
 func buildLogger(level string) (*zap.Logger, error) {
-	cfg := zap.NewProductionConfig()
+	var cfg zap.Config
+	if config.DevMode {
+		fmt.Println("Now running in dev mode")
+		cfg = zap.NewDevelopmentConfig()
+	} else {
+		cfg = zap.NewProductionConfig()
+	}
 	if err := cfg.Level.UnmarshalText([]byte(strings.ToLower(level))); err != nil {
 		cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
@@ -173,6 +195,12 @@ func registerSQLiteDriver() {
 	registerSQLiteOnce.Do(func() {
 		sql.Register(sqliteDriverName, &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				err := conn.LoadExtension(hammdistSOName, "sqlite3_hammdist_init")
+				if err == nil {
+					fmt.Println("hammdist.so loaded")
+					return nil
+				}
+				fmt.Println("loaded hammdist.so failed, err: " + err.Error())
 				return conn.RegisterFunc("hamming_distance", hammingDistance, true)
 			},
 		})
@@ -185,15 +213,7 @@ func (a *App) initDB() error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-
 	if err := applyPragmas(db); err != nil {
-		db.Close()
-		return err
-	}
-	if err := ensureSchema(db); err != nil {
 		db.Close()
 		return err
 	}
@@ -216,35 +236,19 @@ func applyPragmas(db *sql.DB) error {
 	return nil
 }
 
-func ensureSchema(db *sql.DB) error {
-	schema, err := os.ReadFile(filepath.Join("sql", "schema_mars.sql"))
-	if err != nil {
-		return fmt.Errorf("read schema: %w", err)
-	}
-	if _, err := db.Exec(string(schema)); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	return nil
-}
-
 func (a *App) initHTTPClients() error {
 	transport := &http.Transport{}
-	if a.cfg.BotProxy != "" {
-		u, err := url.Parse(a.cfg.BotProxy)
-		if err != nil {
-			return fmt.Errorf("parse BOT_PROXY: %w", err)
-		}
-		transport.Proxy = http.ProxyURL(u)
+	if a.cfg.BotProxy != nil {
+		transport.Proxy = http.ProxyURL(a.cfg.BotProxy)
 	}
 
 	a.fileClient = &http.Client{
-		Timeout:   20 * time.Second,
+		Timeout:   fileDownloadTimeout,
 		Transport: transport,
 	}
 	if a.cfg.ReportStatUrl != "" {
 		a.reportClient = &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: transport,
+			Timeout: reportRequestTimeout,
 		}
 	}
 	return nil
@@ -253,7 +257,7 @@ func (a *App) initHTTPClients() error {
 func (a *App) buildBot() (*gotgbot.Bot, error) {
 	client := &gotgbot.BaseBotClient{
 		Client: http.Client{
-			Timeout:   15 * time.Second,
+			Timeout:   botRequestTimeout,
 			Transport: a.fileClient.Transport,
 		},
 	}
@@ -273,8 +277,7 @@ func (a *App) buildBot() (*gotgbot.Bot, error) {
 
 func (a *App) registerHandlers(dispatcher *ext.Dispatcher) {
 	dispatcher.AddHandler(handlers.NewMessage(message.Photo, a.handlePhoto).
-		SetAllowChannel(true).
-		SetAllowEdited(true))
+		SetAllowChannel(true))
 	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("wl:"), a.handleAddPicWhitelistByCallback))
 	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("find:"), a.handleFindSimilarByCallback))
 	dispatcher.AddHandler(handlers.NewCommand("pic_info", a.handlePicInfo))
@@ -593,7 +596,7 @@ func (a *App) reportStat(groupID int64, marsCount int64) {
 	if a.reportClient == nil || a.cfg.ReportStatUrl == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), reportStatTimeout)
 	defer cancel()
 	body, _ := json.Marshal(map[string]int64{
 		"group_id":   groupID,
@@ -790,9 +793,9 @@ func (a *App) handleBotStat(b *gotgbot.Bot, ctx *ext.Context) error {
 		"当前群组ID: %d\n"+
 		"您是 %s(id:%d)，您%s本群的白名单当中\n"+
 		"本群一共记录了 %d 张不同的图片\n"+
-		"本次统计共耗时 %.2f ms\n"+
+		"本次统计共耗时 %s\n"+
 		"火星车与您同在",
-		groupCount, ctx.EffectiveChat.Id, userDisplayName(ctx.EffectiveUser), ctx.EffectiveUser.Id, exists, marsCount, float64(duration.Microseconds())/1000),
+		groupCount, ctx.EffectiveChat.Id, userDisplayName(ctx.EffectiveUser), ctx.EffectiveUser.Id, exists, marsCount, duration),
 		&gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 	return err
 }
@@ -977,39 +980,16 @@ func (a *App) handleFindSimilarByCallback(b *gotgbot.Bot, ctx *ext.Context) erro
 	}
 
 	start := time.Now()
-	items, err := a.queries.ListSimilarPhotos(context.Background(), target, ctx.EffectiveChat.Id, 6)
+	items, err := a.queries.ListSimilarPhotos(context.Background(), target, ctx.EffectiveChat.Id, similarHDThreshold)
 	if err != nil {
 		return err
 	}
-	type similar struct {
-		info q.MarsInfo
-		hd   int64
-	}
-	var results []similar
-	for _, item := range items {
-		hd, err := hammingDistance(item.MarsInfo.PicDhash, target)
-		if err != nil {
-			continue
-		}
-		if hd < similarHDThreshold {
-			results = append(results, similar{info: item.MarsInfo, hd: hd})
-		}
-	}
-	if len(results) > 1 {
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].hd < results[j].hd
-		})
-	}
-	if len(results) > 10 {
-		results = results[:10]
-	}
-
 	var textLines []string
-	textLines = append(textLines, fmt.Sprintf("火星车为您找到了%d张相似的图片\n这些图片的汉明距离小于%d\n耗时:%dms\n",
-		len(results), similarHDThreshold, time.Since(start).Milliseconds()))
-	for i, item := range results {
-		startLabel, endLabel := buildLabel(ctx.EffectiveChat, item.info.LastMsgID)
-		textLines = append(textLines, fmt.Sprintf("%s图片%d: 距离: %d 消息ID: %d%s", startLabel, i+1, item.hd, item.info.LastMsgID, endLabel))
+	textLines = append(textLines, fmt.Sprintf("火星车为您找到了%d张相似的图片\n这些图片的汉明距离小于%d\n耗时:%s\n",
+		len(items), similarHDThreshold, time.Since(start)))
+	for i, item := range items {
+		startLabel, endLabel := buildLabel(ctx.EffectiveChat, item.MarsInfo.LastMsgID)
+		textLines = append(textLines, fmt.Sprintf("%s图片%d: 距离: %d 消息ID: %d%s", startLabel, i+1, item.Hd, item.MarsInfo.LastMsgID, endLabel))
 	}
 	_, err = b.SendMessage(ctx.EffectiveChat.Id, strings.Join(textLines, "\n"),
 		&gotgbot.SendMessageOpts{

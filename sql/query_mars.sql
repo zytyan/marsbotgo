@@ -72,7 +72,7 @@ WHERE group_id = ?;
 
 -- name: ListSimilarPhotos :many
 SELECT sqlc.embed(mars_info),
-       hamming_distance(pic_dhash, CAST(@src_dhash AS BLOB)) AS hd
+       CAST(hamming_distance(pic_dhash, CAST(@src_dhash AS BLOB)) AS INTEGER) AS hd
 FROM mars_info
 WHERE group_id = ?
   AND hd < CAST(@min_distance AS INTEGER)

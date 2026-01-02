@@ -25,13 +25,13 @@ CREATE TABLE IF NOT EXISTS "mars_info"
     check (last_msg_id >= 0)
 ) without rowid;
 
-CREATE TABLE mars_group_stat
+CREATE TABLE IF NOT EXISTS mars_group_stat
 (
     group_id    INTEGER PRIMARY KEY NOT NULL,
     image_count INTEGER             NOT NULL DEFAULT 0 CHECK (image_count >= 0)
 ) WITHOUT ROWID;
 
-CREATE TABLE mars_stat_meta
+CREATE TABLE IF NOT EXISTS mars_stat_meta
 (
     key   TEXT PRIMARY KEY NOT NULL,
     value INTEGER          NOT NULL
