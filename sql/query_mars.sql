@@ -32,4 +32,4 @@ VALUES (?, ?);
 DELETE
 FROM group_user_in_whitelist
 WHERE group_id = ?
-  AND user_id = ?
+  AND user_id = ?;
