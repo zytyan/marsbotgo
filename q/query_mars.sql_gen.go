@@ -37,6 +37,29 @@ func (q *Queries) AddUserToWhitelist(ctx context.Context, groupID int64, userID 
 	return err
 }
 
+const countGroups = `-- name: CountGroups :one
+SELECT COUNT(*)
+FROM mars_group_stat
+WHERE group_id < 0
+`
+
+func (q *Queries) CountGroups(ctx context.Context) (int64, error) {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields, zap.Dict("fields"))
+		}
+	}
+	row := q.queryRow(ctx, q.countGroupsStmt, countGroups)
+	var count int64
+	err := row.Scan(&count)
+	q.logQuery(countGroups, "CountGroups", logFields, err, start)
+	return count, err
+}
+
 const deleteUserFromWhitelist = `-- name: DeleteUserFromWhitelist :exec
 DELETE
 FROM group_user_in_whitelist
@@ -91,6 +114,33 @@ func (q *Queries) GetDhashFromFileUid(ctx context.Context, fuid string) ([]byte,
 	return dhash, err
 }
 
+const getGroupMarsCount = `-- name: GetGroupMarsCount :one
+SELECT image_count
+FROM mars_group_stat
+WHERE group_id = ?
+`
+
+func (q *Queries) GetGroupMarsCount(ctx context.Context, groupID int64) (int64, error) {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.Int64("group_id", groupID),
+				),
+			)
+		}
+	}
+	row := q.queryRow(ctx, q.getGroupMarsCountStmt, getGroupMarsCount, groupID)
+	var image_count int64
+	err := row.Scan(&image_count)
+	q.logQuery(getGroupMarsCount, "GetGroupMarsCount", logFields, err, start)
+	return image_count, err
+}
+
 const getMarsInfo = `-- name: GetMarsInfo :one
 SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
 FROM mars_info
@@ -126,6 +176,72 @@ func (q *Queries) GetMarsInfo(ctx context.Context, groupID int64, picDhash []byt
 	return i, err
 }
 
+const incrementGroupStat = `-- name: IncrementGroupStat :exec
+INSERT INTO mars_group_stat (group_id, image_count)
+VALUES (?, 1)
+ON CONFLICT(group_id) DO UPDATE SET image_count = image_count + 1
+`
+
+func (q *Queries) IncrementGroupStat(ctx context.Context, groupID int64) error {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.Int64("group_id", groupID),
+				),
+			)
+		}
+	}
+	_, err := q.exec(ctx, q.incrementGroupStatStmt, incrementGroupStat, groupID)
+	q.logQuery(incrementGroupStat, "IncrementGroupStat", logFields, err, start)
+	return err
+}
+
+const incrementMarsInfo = `-- name: IncrementMarsInfo :one
+INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
+VALUES (?, ?, 1, ?, 0)
+ON CONFLICT(group_id, pic_dhash) DO UPDATE SET count       = count + 1,
+                                               last_msg_id = excluded.last_msg_id
+RETURNING group_id,
+    pic_dhash,
+    count,
+    last_msg_id,
+    in_whitelist
+`
+
+func (q *Queries) IncrementMarsInfo(ctx context.Context, groupID int64, picDhash []byte, lastMsgID int64) (MarsInfo, error) {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.Int64("group_id", groupID),
+					zap.ByteString("pic_dhash", picDhash),
+					zap.Int64("last_msg_id", lastMsgID),
+				),
+			)
+		}
+	}
+	row := q.queryRow(ctx, q.incrementMarsInfoStmt, incrementMarsInfo, groupID, picDhash, lastMsgID)
+	var i MarsInfo
+	err := row.Scan(
+		&i.GroupID,
+		&i.PicDhash,
+		&i.Count,
+		&i.LastMsgID,
+		&i.InWhitelist,
+	)
+	q.logQuery(incrementMarsInfo, "IncrementMarsInfo", logFields, err, start)
+	return i, err
+}
+
 const isUserInWhitelist = `-- name: IsUserInWhitelist :one
 SELECT EXISTS (SELECT 1 FROM group_user_in_whitelist WHERE group_id = ? AND user_id = ?)
 `
@@ -150,6 +266,147 @@ func (q *Queries) IsUserInWhitelist(ctx context.Context, groupID int64, userID i
 	err := row.Scan(&column_1)
 	q.logQuery(isUserInWhitelist, "IsUserInWhitelist", logFields, err, start)
 	return column_1, err
+}
+
+const listMarsInfoByGroup = `-- name: ListMarsInfoByGroup :many
+SELECT group_id, pic_dhash, count, last_msg_id, in_whitelist
+FROM mars_info
+WHERE group_id = ?
+`
+
+func (q *Queries) ListMarsInfoByGroup(ctx context.Context, groupID int64) ([]MarsInfo, error) {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.Int64("group_id", groupID),
+				),
+			)
+		}
+	}
+	rows, err := q.query(ctx, q.listMarsInfoByGroupStmt, listMarsInfoByGroup, groupID)
+	defer func() {
+		q.logQuery(listMarsInfoByGroup, "ListMarsInfoByGroup", logFields, err, start)
+	}()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MarsInfo
+	for rows.Next() {
+		var i MarsInfo
+		if err = rows.Scan(
+			&i.GroupID,
+			&i.PicDhash,
+			&i.Count,
+			&i.LastMsgID,
+			&i.InWhitelist,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSimilarPhotos = `-- name: ListSimilarPhotos :many
+SELECT mars_info.group_id, mars_info.pic_dhash, mars_info.count, mars_info.last_msg_id, mars_info.in_whitelist,
+       hamming_distance(pic_dhash, CAST(? AS BLOB)) AS hd
+FROM mars_info
+WHERE group_id = ?
+  AND hd < CAST(? AS INTEGER)
+ORDER BY hd
+LIMIT 10
+`
+
+type ListSimilarPhotosRow struct {
+	MarsInfo MarsInfo    `json:"mars_info"`
+	Hd       interface{} `json:"hd"`
+}
+
+func (q *Queries) ListSimilarPhotos(ctx context.Context, srcDhash []byte, groupID int64, minDistance int64) ([]ListSimilarPhotosRow, error) {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.ByteString("src_dhash", srcDhash),
+					zap.Int64("group_id", groupID),
+					zap.Int64("min_distance", minDistance),
+				),
+			)
+		}
+	}
+	rows, err := q.query(ctx, q.listSimilarPhotosStmt, listSimilarPhotos, srcDhash, groupID, minDistance)
+	defer func() {
+		q.logQuery(listSimilarPhotos, "ListSimilarPhotos", logFields, err, start)
+	}()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListSimilarPhotosRow
+	for rows.Next() {
+		var i ListSimilarPhotosRow
+		if err = rows.Scan(
+			&i.MarsInfo.GroupID,
+			&i.MarsInfo.PicDhash,
+			&i.MarsInfo.Count,
+			&i.MarsInfo.LastMsgID,
+			&i.MarsInfo.InWhitelist,
+			&i.Hd,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setMarsWhitelist = `-- name: SetMarsWhitelist :exec
+INSERT INTO mars_info (group_id, pic_dhash, count, last_msg_id, in_whitelist)
+VALUES (?, ?, 0, 0, ?)
+ON CONFLICT(group_id, pic_dhash) DO UPDATE SET in_whitelist = excluded.in_whitelist
+`
+
+func (q *Queries) SetMarsWhitelist(ctx context.Context, groupID int64, picDhash []byte, inWhitelist int64) error {
+	var logFields []zap.Field
+	var start time.Time
+	if q.logger != nil {
+		logFields = make([]zap.Field, 0, 8)
+		start = time.Now()
+		if q.LogArgument {
+			logFields = append(logFields,
+				zap.Dict("fields",
+					zap.Int64("group_id", groupID),
+					zap.ByteString("pic_dhash", picDhash),
+					zap.Int64("in_whitelist", inWhitelist),
+				),
+			)
+		}
+	}
+	_, err := q.exec(ctx, q.setMarsWhitelistStmt, setMarsWhitelist, groupID, picDhash, inWhitelist)
+	q.logQuery(setMarsWhitelist, "SetMarsWhitelist", logFields, err, start)
+	return err
 }
 
 const upsertDhash = `-- name: UpsertDhash :exec

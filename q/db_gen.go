@@ -31,17 +31,38 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.addUserToWhitelistStmt, err = db.PrepareContext(ctx, addUserToWhitelist); err != nil {
 		return nil, fmt.Errorf("error preparing query AddUserToWhitelist: %w", err)
 	}
+	if q.countGroupsStmt, err = db.PrepareContext(ctx, countGroups); err != nil {
+		return nil, fmt.Errorf("error preparing query CountGroups: %w", err)
+	}
 	if q.deleteUserFromWhitelistStmt, err = db.PrepareContext(ctx, deleteUserFromWhitelist); err != nil {
 		return nil, fmt.Errorf("error preparing query DeleteUserFromWhitelist: %w", err)
 	}
 	if q.getDhashFromFileUidStmt, err = db.PrepareContext(ctx, getDhashFromFileUid); err != nil {
 		return nil, fmt.Errorf("error preparing query GetDhashFromFileUid: %w", err)
 	}
+	if q.getGroupMarsCountStmt, err = db.PrepareContext(ctx, getGroupMarsCount); err != nil {
+		return nil, fmt.Errorf("error preparing query GetGroupMarsCount: %w", err)
+	}
 	if q.getMarsInfoStmt, err = db.PrepareContext(ctx, getMarsInfo); err != nil {
 		return nil, fmt.Errorf("error preparing query GetMarsInfo: %w", err)
 	}
+	if q.incrementGroupStatStmt, err = db.PrepareContext(ctx, incrementGroupStat); err != nil {
+		return nil, fmt.Errorf("error preparing query IncrementGroupStat: %w", err)
+	}
+	if q.incrementMarsInfoStmt, err = db.PrepareContext(ctx, incrementMarsInfo); err != nil {
+		return nil, fmt.Errorf("error preparing query IncrementMarsInfo: %w", err)
+	}
 	if q.isUserInWhitelistStmt, err = db.PrepareContext(ctx, isUserInWhitelist); err != nil {
 		return nil, fmt.Errorf("error preparing query IsUserInWhitelist: %w", err)
+	}
+	if q.listMarsInfoByGroupStmt, err = db.PrepareContext(ctx, listMarsInfoByGroup); err != nil {
+		return nil, fmt.Errorf("error preparing query ListMarsInfoByGroup: %w", err)
+	}
+	if q.listSimilarPhotosStmt, err = db.PrepareContext(ctx, listSimilarPhotos); err != nil {
+		return nil, fmt.Errorf("error preparing query ListSimilarPhotos: %w", err)
+	}
+	if q.setMarsWhitelistStmt, err = db.PrepareContext(ctx, setMarsWhitelist); err != nil {
+		return nil, fmt.Errorf("error preparing query SetMarsWhitelist: %w", err)
 	}
 	if q.upsertDhashStmt, err = db.PrepareContext(ctx, upsertDhash); err != nil {
 		return nil, fmt.Errorf("error preparing query UpsertDhash: %w", err)
@@ -59,6 +80,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing addUserToWhitelistStmt: %w", cerr)
 		}
 	}
+	if q.countGroupsStmt != nil {
+		if cerr := q.countGroupsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countGroupsStmt: %w", cerr)
+		}
+	}
 	if q.deleteUserFromWhitelistStmt != nil {
 		if cerr := q.deleteUserFromWhitelistStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing deleteUserFromWhitelistStmt: %w", cerr)
@@ -69,14 +95,44 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getDhashFromFileUidStmt: %w", cerr)
 		}
 	}
+	if q.getGroupMarsCountStmt != nil {
+		if cerr := q.getGroupMarsCountStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getGroupMarsCountStmt: %w", cerr)
+		}
+	}
 	if q.getMarsInfoStmt != nil {
 		if cerr := q.getMarsInfoStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getMarsInfoStmt: %w", cerr)
 		}
 	}
+	if q.incrementGroupStatStmt != nil {
+		if cerr := q.incrementGroupStatStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing incrementGroupStatStmt: %w", cerr)
+		}
+	}
+	if q.incrementMarsInfoStmt != nil {
+		if cerr := q.incrementMarsInfoStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing incrementMarsInfoStmt: %w", cerr)
+		}
+	}
 	if q.isUserInWhitelistStmt != nil {
 		if cerr := q.isUserInWhitelistStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing isUserInWhitelistStmt: %w", cerr)
+		}
+	}
+	if q.listMarsInfoByGroupStmt != nil {
+		if cerr := q.listMarsInfoByGroupStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listMarsInfoByGroupStmt: %w", cerr)
+		}
+	}
+	if q.listSimilarPhotosStmt != nil {
+		if cerr := q.listSimilarPhotosStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listSimilarPhotosStmt: %w", cerr)
+		}
+	}
+	if q.setMarsWhitelistStmt != nil {
+		if cerr := q.setMarsWhitelistStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setMarsWhitelistStmt: %w", cerr)
 		}
 	}
 	if q.upsertDhashStmt != nil {
@@ -134,10 +190,17 @@ type Queries struct {
 	LogArgument                 bool
 	tx                          *sql.Tx
 	addUserToWhitelistStmt      *sql.Stmt
+	countGroupsStmt             *sql.Stmt
 	deleteUserFromWhitelistStmt *sql.Stmt
 	getDhashFromFileUidStmt     *sql.Stmt
+	getGroupMarsCountStmt       *sql.Stmt
 	getMarsInfoStmt             *sql.Stmt
+	incrementGroupStatStmt      *sql.Stmt
+	incrementMarsInfoStmt       *sql.Stmt
 	isUserInWhitelistStmt       *sql.Stmt
+	listMarsInfoByGroupStmt     *sql.Stmt
+	listSimilarPhotosStmt       *sql.Stmt
+	setMarsWhitelistStmt        *sql.Stmt
 	upsertDhashStmt             *sql.Stmt
 	upsertMarsInfoStmt          *sql.Stmt
 }
@@ -152,10 +215,17 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		LogArgument:                 q.LogArgument,
 		tx:                          tx,
 		addUserToWhitelistStmt:      q.addUserToWhitelistStmt,
+		countGroupsStmt:             q.countGroupsStmt,
 		deleteUserFromWhitelistStmt: q.deleteUserFromWhitelistStmt,
 		getDhashFromFileUidStmt:     q.getDhashFromFileUidStmt,
+		getGroupMarsCountStmt:       q.getGroupMarsCountStmt,
 		getMarsInfoStmt:             q.getMarsInfoStmt,
+		incrementGroupStatStmt:      q.incrementGroupStatStmt,
+		incrementMarsInfoStmt:       q.incrementMarsInfoStmt,
 		isUserInWhitelistStmt:       q.isUserInWhitelistStmt,
+		listMarsInfoByGroupStmt:     q.listMarsInfoByGroupStmt,
+		listSimilarPhotosStmt:       q.listSimilarPhotosStmt,
+		setMarsWhitelistStmt:        q.setMarsWhitelistStmt,
 		upsertDhashStmt:             q.upsertDhashStmt,
 		upsertMarsInfoStmt:          q.upsertMarsInfoStmt,
 	}
