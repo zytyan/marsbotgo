@@ -214,6 +214,7 @@ func initDB() error {
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=OFF;",
 		"PRAGMA cache_size=-80000;",
+		"PRAGMA busy_timeout=5000;",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
