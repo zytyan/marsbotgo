@@ -301,9 +301,12 @@ func processSinglePhoto(bot *gotgbot.Bot, msg *gotgbot.Message) error {
 	}
 
 	reply := buildMarsReply(&msg.Chat, result.PrevCount, result.PrevLastMsgID)
-	var markup *gotgbot.InlineKeyboardMarkup
+	opt := &gotgbot.SendMessageOpts{
+		ReplyParameters: replyTo(msg.MessageId),
+		ParseMode:       "HTML",
+	}
 	if result.PrevCount > 3 {
-		markup = &gotgbot.InlineKeyboardMarkup{
+		opt.ReplyMarkup = &gotgbot.InlineKeyboardMarkup{
 			InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{
 				{
 					Text:         "将图片添加至白名单",
@@ -312,11 +315,7 @@ func processSinglePhoto(bot *gotgbot.Bot, msg *gotgbot.Message) error {
 			}},
 		}
 	}
-	_, err = bot.SendMessage(msg.Chat.Id, reply, &gotgbot.SendMessageOpts{
-		ReplyParameters: replyTo(msg.MessageId),
-		ParseMode:       "HTML",
-		ReplyMarkup:     markup,
-	})
+	_, err = bot.SendMessage(msg.Chat.Id, reply, opt)
 	if err != nil {
 		logger.Warn("send mars reply", zap.Error(err))
 	}
