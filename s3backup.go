@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -196,7 +195,7 @@ func zstdFile(path string) (string, error) {
 func uploadToS3(ctx context.Context, path string) error {
 	client, err := minio.New(config.S3ApiEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(config.S3ApiKeyID, config.S3ApiKeySecret, ""),
-		Secure: strings.HasPrefix(config.S3ApiEndpoint, "https"),
+		Secure: true,
 	})
 	if err != nil {
 		return fmt.Errorf("create s3 client: %w", err)
