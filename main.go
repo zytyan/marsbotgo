@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/bits"
 	"net/http"
 	"net/url"
 	"os"
@@ -57,7 +56,7 @@ var config Config
 
 const (
 	sqliteDriverName           = "marsbot_sqlite"
-	groupedMediaWait           = 1500 * time.Millisecond
+	groupedMediaWait           = 1 * time.Second
 	mediaGroupLimit            = 10
 	similarHDThreshold   int64 = 6
 	exportCooldown             = 10 * time.Minute
@@ -71,7 +70,19 @@ const (
 	hammdistSOName = "hammdist_c/libhammdist.so"
 )
 
-var registerSQLiteOnce sync.Once
+var (
+	logger       *zap.Logger
+	db           *sql.DB
+	queries      *q.Queries
+	fileClient   *http.Client
+	reportClient *http.Client
+	mediaMu      sync.Mutex
+	mediaGroups  map[string]chan *gotgbot.Message
+
+	exportMu           sync.Mutex
+	exporting          map[int64]*exportState
+	registerSQLiteOnce sync.Once
+)
 
 type marsResult struct {
 	PrevCount     int64
@@ -85,42 +96,55 @@ type exportState struct {
 	timer   *time.Timer
 }
 
-type App struct {
-	cfg Config
-	log *zap.Logger
-
-	db      *sql.DB
-	queries *q.Queries
-
-	bot *gotgbot.Bot
-
-	fileClient   *http.Client
-	fileOpts     *gotgbot.RequestOpts
-	reportClient *http.Client
-
-	mediaMu     sync.Mutex
-	mediaGroups map[string][]*gotgbot.Message
-
-	exportMu  sync.Mutex
-	exporting map[int64]*exportState
-}
-
 func main() {
-	err := env.Parse(&config)
-	if err != nil {
+	if err := env.Parse(&config); err != nil {
 		fmt.Println(err.Error())
 		os.Exit(2)
 	}
-	logger, err := buildLogger(config.LogLevel)
+	var err error
+	logger, err = buildLogger(config.LogLevel)
 	if err != nil {
 		panic(err)
 	}
 	defer logger.Sync()
 
-	app, updater, err := buildApp(logger)
-	if err != nil {
-		logger.Fatal("failed to start", zap.Error(err))
+	mediaGroups = make(map[string]chan *gotgbot.Message)
+	exporting = make(map[int64]*exportState)
+
+	if err := initDB(); err != nil {
+		logger.Fatal("failed to start: init db", zap.Error(err))
 	}
+	bot, err := buildBot()
+	if err != nil {
+		logger.Fatal("failed to start: build bot", zap.Error(err))
+	}
+
+	dp := ext.NewDispatcher(&ext.DispatcherOpts{
+		Error: func(_ *gotgbot.Bot, _ *ext.Context, err error) ext.DispatcherAction {
+			logger.Warn("handler error", zap.Error(err))
+			return ext.DispatcherActionNoop
+		},
+		Panic: func(_ *gotgbot.Bot, _ *ext.Context, r interface{}) {
+			logger.Error("handler panic", zap.Any("r", r), zap.Stack("stack"))
+		},
+	})
+	dp.AddHandler(handlers.NewMessage(message.Photo, handlePhoto).
+		SetAllowChannel(true))
+	dp.AddHandler(handlers.NewCallback(callbackquery.Prefix("wl:"), handleAddPicWhitelistByCallback))
+	dp.AddHandler(handlers.NewCallback(callbackquery.Prefix("find:"), handleFindSimilarByCallback))
+	dp.AddHandler(handlers.NewCommand("pic_info", handlePicInfo))
+	dp.AddHandler(handlers.NewCommand("add_whitelist", handleAddToWhitelist))
+	dp.AddHandler(handlers.NewCommand("remove_whitelist", handleRemoveFromWhitelist))
+	dp.AddHandler(handlers.NewCommand("add_me_to_whitelist", handleAddUserToWhitelist))
+	dp.AddHandler(handlers.NewCommand("remove_me_from_whitelist", handleRemoveUserFromWhitelist))
+	dp.AddHandler(handlers.NewCommand("stat", handleBotStat))
+	dp.AddHandler(handlers.NewCommand("help", handleHelp))
+	dp.AddHandler(handlers.NewCommand("start", handleHelp))
+	dp.AddHandler(handlers.NewCommand("mars_bot_welcome", handleCmdWelcome))
+	dp.AddHandler(handlers.NewCommand("ensure_marsbot_export", handleExportData))
+	dp.AddHandler(handlers.NewCommand("export", handleExportHelp))
+	dp.AddHandler(handlers.NewMyChatMember(chatmember.All, handleWelcome))
+	updater := ext.NewUpdater(dp, nil)
 
 	allowed := []string{
 		"callback_query",
@@ -135,46 +159,11 @@ func main() {
 		},
 	}
 
-	if err := updater.StartPolling(app.bot, pollingOpts); err != nil {
+	if err := updater.StartPolling(bot, pollingOpts); err != nil {
 		logger.Fatal("failed to start polling", zap.Error(err))
 	}
-	logger.Info("marsbot is running", zap.String("username", app.bot.Username))
+	logger.Info("marsbot is running", zap.String("username", bot.Username))
 	updater.Idle()
-}
-
-func buildApp(logger *zap.Logger) (*App, *ext.Updater, error) {
-	app := &App{
-		cfg:         config,
-		log:         logger,
-		mediaGroups: make(map[string][]*gotgbot.Message),
-		exporting:   make(map[int64]*exportState),
-	}
-
-	if err := app.initDB(); err != nil {
-		return nil, nil, err
-	}
-	if err := app.initHTTPClients(); err != nil {
-		return nil, nil, err
-	}
-
-	bot, err := app.buildBot()
-	if err != nil {
-		return nil, nil, err
-	}
-	app.bot = bot
-
-	dispatcher := ext.NewDispatcher(&ext.DispatcherOpts{
-		Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
-			logger.Warn("handler error", zap.Error(err))
-			return ext.DispatcherActionNoop
-		},
-		Panic: func(b *gotgbot.Bot, ctx *ext.Context, r interface{}) {
-			logger.Error("handler panic", zap.Any("r", r), zap.Stack("stack"))
-		},
-	})
-	app.registerHandlers(dispatcher)
-	updater := ext.NewUpdater(dispatcher, nil)
-	return app, updater, nil
 }
 
 func buildLogger(level string) (*zap.Logger, error) {
@@ -207,22 +196,13 @@ func registerSQLiteDriver() {
 	})
 }
 
-func (a *App) initDB() error {
+func initDB() error {
 	registerSQLiteDriver()
-	db, err := sql.Open(sqliteDriverName, a.cfg.DbPath)
+	var err error
+	db, err = sql.Open(sqliteDriverName, config.DbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	if err := applyPragmas(db); err != nil {
-		db.Close()
-		return err
-	}
-	a.db = db
-	a.queries = q.New(db)
-	return nil
-}
-
-func applyPragmas(db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=OFF;",
@@ -230,71 +210,46 @@ func applyPragmas(db *sql.DB) error {
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
+			db.Close()
 			return fmt.Errorf("apply pragma %q: %w", p, err)
 		}
 	}
+	queries = q.NewWithLogger(db, logger)
 	return nil
 }
 
-func (a *App) initHTTPClients() error {
+func buildBot() (*gotgbot.Bot, error) {
 	transport := &http.Transport{}
-	if a.cfg.BotProxy != nil {
-		transport.Proxy = http.ProxyURL(a.cfg.BotProxy)
+	if config.BotProxy != nil {
+		transport.Proxy = http.ProxyURL(config.BotProxy)
 	}
 
-	a.fileClient = &http.Client{
+	fileClient = &http.Client{
 		Timeout:   fileDownloadTimeout,
 		Transport: transport,
 	}
-	if a.cfg.ReportStatUrl != "" {
-		a.reportClient = &http.Client{
+	if config.ReportStatUrl != "" {
+		reportClient = &http.Client{
 			Timeout: reportRequestTimeout,
 		}
 	}
-	return nil
-}
-
-func (a *App) buildBot() (*gotgbot.Bot, error) {
 	client := &gotgbot.BaseBotClient{
 		Client: http.Client{
 			Timeout:   botRequestTimeout,
-			Transport: a.fileClient.Transport,
+			Transport: fileClient.Transport,
 		},
 	}
-	if a.cfg.BotBaseUrl != "" {
-		client.DefaultRequestOpts = &gotgbot.RequestOpts{APIURL: a.cfg.BotBaseUrl}
+	if config.BotBaseUrl != "" {
+		client.DefaultRequestOpts = &gotgbot.RequestOpts{APIURL: config.BotBaseUrl}
 	}
-
-	bot, err := gotgbot.NewBot(a.cfg.BotToken, &gotgbot.BotOpts{BotClient: client})
+	bot, err := gotgbot.NewBot(config.BotToken, &gotgbot.BotOpts{BotClient: client})
 	if err != nil {
 		return nil, fmt.Errorf("create bot: %w", err)
 	}
-	if a.cfg.BotBaseFileUrl != "" {
-		a.fileOpts = &gotgbot.RequestOpts{APIURL: a.cfg.BotBaseFileUrl}
-	}
-	return bot, nil
+	return bot, err
 }
 
-func (a *App) registerHandlers(dispatcher *ext.Dispatcher) {
-	dispatcher.AddHandler(handlers.NewMessage(message.Photo, a.handlePhoto).
-		SetAllowChannel(true))
-	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("wl:"), a.handleAddPicWhitelistByCallback))
-	dispatcher.AddHandler(handlers.NewCallback(callbackquery.Prefix("find:"), a.handleFindSimilarByCallback))
-	dispatcher.AddHandler(handlers.NewCommand("pic_info", a.handlePicInfo))
-	dispatcher.AddHandler(handlers.NewCommand("add_whitelist", a.handleAddToWhitelist))
-	dispatcher.AddHandler(handlers.NewCommand("remove_whitelist", a.handleRemoveFromWhitelist))
-	dispatcher.AddHandler(handlers.NewCommand("add_me_to_whitelist", a.handleAddUserToWhitelist))
-	dispatcher.AddHandler(handlers.NewCommand("remove_me_from_whitelist", a.handleRemoveUserFromWhitelist))
-	dispatcher.AddHandler(handlers.NewCommand("stat", a.handleBotStat))
-	dispatcher.AddHandler(handlers.NewCommand("help", a.handleHelp))
-	dispatcher.AddHandler(handlers.NewCommand("start", a.handleHelp))
-	dispatcher.AddHandler(handlers.NewCommand("mars_bot_welcome", a.handleCmdWelcome))
-	dispatcher.AddHandler(handlers.NewCommand("ensure_marsbot_export", a.handleExportData))
-	dispatcher.AddHandler(handlers.NewCommand("export", a.handleExportHelp))
-	dispatcher.AddHandler(handlers.NewMyChatMember(chatmember.All, a.handleWelcome))
-}
-
-func (a *App) handlePhoto(b *gotgbot.Bot, ctx *ext.Context) error {
+func handlePhoto(bot *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
 	chat := ctx.EffectiveChat
 	if msg == nil || chat == nil || len(msg.Photo) == 0 {
@@ -306,9 +261,9 @@ func (a *App) handlePhoto(b *gotgbot.Bot, ctx *ext.Context) error {
 	}
 
 	if ctx.EffectiveUser != nil {
-		inWl, err := a.isUserInWhitelist(context.Background(), chat.Id, ctx.EffectiveUser.Id)
+		inWl, err := isUserInWhitelist(context.Background(), chat.Id, ctx.EffectiveUser.Id)
 		if err != nil {
-			a.log.Warn("check user whitelist", zap.Error(err))
+			logger.Warn("check user whitelist", zap.Error(err))
 		}
 		if inWl {
 			return nil
@@ -316,20 +271,20 @@ func (a *App) handlePhoto(b *gotgbot.Bot, ctx *ext.Context) error {
 	}
 
 	if msg.MediaGroupId != "" {
-		a.enqueueMediaGroup(msg)
+		enqueueMediaGroup(bot, msg)
 		return nil
 	}
-	return a.processSinglePhoto(msg)
+	return processSinglePhoto(bot, msg)
 }
 
-func (a *App) processSinglePhoto(msg *gotgbot.Message) error {
+func processSinglePhoto(bot *gotgbot.Bot, msg *gotgbot.Message) error {
 	ctx := context.Background()
 	photo := msg.Photo[len(msg.Photo)-1]
-	dhash, err := a.getDHash(ctx, a.bot, photo)
+	dhash, err := getDHash(ctx, bot, photo)
 	if err != nil {
 		return err
 	}
-	result, err := a.recordMars(ctx, msg.Chat.Id, msg.MessageId, dhash)
+	result, err := recordMars(ctx, msg.Chat.Id, msg.MessageId, dhash)
 	if err != nil {
 		return err
 	}
@@ -349,50 +304,58 @@ func (a *App) processSinglePhoto(msg *gotgbot.Message) error {
 			}},
 		}
 	}
-	_, err = a.bot.SendMessage(msg.Chat.Id, reply, &gotgbot.SendMessageOpts{
+	_, err = bot.SendMessage(msg.Chat.Id, reply, &gotgbot.SendMessageOpts{
 		ReplyParameters: replyTo(msg.MessageId),
 		ParseMode:       "HTML",
 		ReplyMarkup:     markup,
 	})
 	if err != nil {
-		a.log.Warn("send mars reply", zap.Error(err))
+		logger.Warn("send mars reply", zap.Error(err))
 	}
-	go a.reportStat(msg.Chat.Id, result.PrevCount)
+	go reportStat(msg.Chat.Id, result.PrevCount)
 	return nil
 }
 
-func (a *App) enqueueMediaGroup(msg *gotgbot.Message) {
-	a.mediaMu.Lock()
-	defer a.mediaMu.Unlock()
-	list := a.mediaGroups[msg.MediaGroupId]
-	if len(list) >= mediaGroupLimit {
-		return
+func enqueueMediaGroup(bot *gotgbot.Bot, msg *gotgbot.Message) {
+	mediaMu.Lock()
+	defer mediaMu.Unlock()
+	c, ok := mediaGroups[msg.MediaGroupId]
+	if !ok {
+		c = make(chan *gotgbot.Message, mediaGroupLimit)
+		mediaGroups[msg.MediaGroupId] = c
+		go flushMediaGroup(bot, msg.MediaGroupId, c)
 	}
-	a.mediaGroups[msg.MediaGroupId] = append(list, msg)
-	if len(list) == 0 {
-		time.AfterFunc(groupedMediaWait, func() {
-			a.flushMediaGroup(msg.MediaGroupId)
-		})
-	}
-}
-
-func (a *App) flushMediaGroup(groupID string) {
-	a.mediaMu.Lock()
-	msgs := a.mediaGroups[groupID]
-	delete(a.mediaGroups, groupID)
-	a.mediaMu.Unlock()
-	if len(msgs) == 0 {
-		return
-	}
-	if len(msgs) > mediaGroupLimit {
-		msgs = msgs[:mediaGroupLimit]
-	}
-	if err := a.handleMediaGroup(msgs); err != nil {
-		a.log.Warn("handle media group", zap.Error(err), zap.String("group_id", groupID))
+	select {
+	case c <- msg:
+	default:
 	}
 }
 
-func (a *App) handleMediaGroup(msgs []*gotgbot.Message) error {
+func flushMediaGroup(bot *gotgbot.Bot, groupID string, c chan *gotgbot.Message) {
+	defer func() {
+		mediaMu.Lock()
+		delete(mediaGroups, groupID)
+		mediaMu.Unlock()
+	}()
+	msgs := make([]*gotgbot.Message, 0, mediaGroupLimit)
+	timer := time.NewTimer(groupedMediaWait)
+	defer timer.Stop()
+loop:
+	for {
+		select {
+		case msg := <-c:
+			msgs = append(msgs, msg)
+			timer.Reset(groupedMediaWait)
+		case <-timer.C:
+			break loop
+		}
+	}
+	if err := handleMediaGroup(bot, msgs); err != nil {
+		logger.Warn("handle media group", zap.Error(err), zap.String("group_id", groupID))
+	}
+}
+
+func handleMediaGroup(bot *gotgbot.Bot, msgs []*gotgbot.Message) error {
 	ctx := context.Background()
 	type item struct {
 		msg *gotgbot.Message
@@ -404,23 +367,23 @@ func (a *App) handleMediaGroup(msgs []*gotgbot.Message) error {
 		if len(msg.Photo) == 0 {
 			continue
 		}
-		dhash, err := a.getDHash(ctx, a.bot, msg.Photo[len(msg.Photo)-1])
+		dhash, err := getDHash(ctx, bot, msg.Photo[len(msg.Photo)-1])
 		if err != nil {
-			a.log.Warn("get dhash for group media", zap.Error(err))
+			logger.Warn("get dhash for group media", zap.Error(err))
 			continue
 		}
 		key := hex.EncodeToString(dhash)
 		if _, ok := unique[key]; ok {
 			continue // avoid duplicate reporting inside one album
 		}
-		res, err := a.recordMars(ctx, msg.Chat.Id, msg.MessageId, dhash)
+		res, err := recordMars(ctx, msg.Chat.Id, msg.MessageId, dhash)
 		if err != nil {
-			a.log.Warn("record mars for group media", zap.Error(err))
+			logger.Warn("record mars for group media", zap.Error(err))
 			continue
 		}
 		unique[key] = &item{msg: msg, res: res}
 		if res.PrevCount > 0 && !res.Skipped {
-			go a.reportStat(msg.Chat.Id, res.PrevCount)
+			go reportStat(msg.Chat.Id, res.PrevCount)
 		}
 	}
 
@@ -437,15 +400,15 @@ func (a *App) handleMediaGroup(msgs []*gotgbot.Message) error {
 		return nil
 	}
 	reply := buildGroupedReply(&best.msg.Chat, best.res.PrevCount, best.res.PrevLastMsgID)
-	_, err := a.bot.SendMessage(best.msg.Chat.Id, reply, &gotgbot.SendMessageOpts{
+	_, err := bot.SendMessage(best.msg.Chat.Id, reply, &gotgbot.SendMessageOpts{
 		ReplyParameters: replyTo(best.msg.MessageId),
 		ParseMode:       "HTML",
 	})
 	return err
 }
 
-func (a *App) getDHash(ctx context.Context, bot *gotgbot.Bot, photo gotgbot.PhotoSize) ([]byte, error) {
-	dhash, err := a.queries.GetDhashFromFileUid(ctx, photo.FileUniqueId)
+func getDHash(ctx context.Context, b *gotgbot.Bot, photo gotgbot.PhotoSize) ([]byte, error) {
+	dhash, err := queries.GetDhashFromFileUid(ctx, photo.FileUniqueId)
 	if err == nil {
 		return dhash, nil
 	}
@@ -453,17 +416,16 @@ func (a *App) getDHash(ctx context.Context, bot *gotgbot.Bot, photo gotgbot.Phot
 		return nil, err
 	}
 
-	file, err := bot.GetFile(photo.FileId, nil)
+	file, err := b.GetFile(photo.FileId, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get file: %w", err)
 	}
 	var data []byte
 	if data2, err := os.ReadFile(file.FilePath); err == nil {
-		// 本地的情况
 		data = data2
 	} else {
-		u := file.URL(bot, a.fileOpts)
-		data, err = a.downloadFile(ctx, u)
+		u := file.URL(b, &gotgbot.RequestOpts{APIURL: config.BotBaseFileUrl})
+		data, err = downloadFile(ctx, u)
 		if err != nil {
 			return nil, err
 		}
@@ -473,18 +435,18 @@ func (a *App) getDHash(ctx context.Context, bot *gotgbot.Bot, photo gotgbot.Phot
 		return nil, err
 	}
 	dhash = dhashArr[:]
-	if err := a.queries.UpsertDhash(ctx, photo.FileUniqueId, dhash); err != nil {
-		a.log.Warn("cache dhash", zap.Error(err))
+	if err := queries.UpsertDhash(ctx, photo.FileUniqueId, dhash); err != nil {
+		logger.Warn("cache dhash", zap.Error(err))
 	}
 	return dhash, nil
 }
 
-func (a *App) downloadFile(ctx context.Context, url string) ([]byte, error) {
+func downloadFile(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	resp, err := a.fileClient.Do(req)
+	resp, err := fileClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download file: %w", err)
 	}
@@ -499,12 +461,12 @@ func (a *App) downloadFile(ctx context.Context, url string) ([]byte, error) {
 	return body, nil
 }
 
-func (a *App) recordMars(ctx context.Context, groupID, msgID int64, dhash []byte) (marsResult, error) {
-	tx, err := a.db.BeginTx(ctx, nil)
+func recordMars(ctx context.Context, groupID, msgID int64, dhash []byte) (marsResult, error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return marsResult{}, err
 	}
-	qtx := a.queries.WithTx(tx)
+	qtx := queries.WithTx(tx)
 
 	info, err := qtx.GetMarsInfo(ctx, groupID, dhash)
 	prevCount := int64(0)
@@ -542,58 +504,16 @@ func (a *App) recordMars(ctx context.Context, groupID, msgID int64, dhash []byte
 	}, nil
 }
 
-func (a *App) isUserInWhitelist(ctx context.Context, groupID, userID int64) (bool, error) {
-	val, err := a.queries.IsUserInWhitelist(ctx, groupID, userID)
+func isUserInWhitelist(ctx context.Context, groupID, userID int64) (bool, error) {
+	val, err := queries.IsUserInWhitelist(ctx, groupID, userID)
 	if err != nil {
 		return false, err
 	}
 	return val != 0, nil
 }
 
-func buildLabel(chat *gotgbot.Chat, msgID int64) (string, string) {
-	if chat == nil || msgID == 0 {
-		return "", ""
-	}
-	var link string
-	switch {
-	case chat.Username != "":
-		link = fmt.Sprintf("https://t.me/%s/%d", chat.Username, msgID)
-	case chat.Id < 0:
-		cid := -chat.Id - 1000000000000
-		link = fmt.Sprintf("https://t.me/c/%d/%d", cid, msgID)
-	}
-	if link == "" {
-		return "", ""
-	}
-	return fmt.Sprintf(`<a href="%s">`, link), "</a>"
-}
-
-func buildMarsReply(chat *gotgbot.Chat, count int64, lastMsgID int64) string {
-	labelStart, labelEnd := buildLabel(chat, lastMsgID)
-	switch {
-	case count < 3:
-		return fmt.Sprintf("这张图片已经%s火星%d次%s了！", labelStart, count, labelEnd)
-	case count == 3:
-		return fmt.Sprintf("这张图已经%s火星了%d次%s了，现在本车送你 ”火星之王“ 称号！", labelStart, count, labelEnd)
-	default:
-		return fmt.Sprintf("火星之王，收了你的神通吧，这张图都让您%s火星%d次%s了！", labelStart, count, labelEnd)
-	}
-}
-
-func buildGroupedReply(chat *gotgbot.Chat, count int64, lastMsgID int64) string {
-	labelStart, labelEnd := buildLabel(chat, lastMsgID)
-	switch {
-	case count < 3:
-		return fmt.Sprintf("这一组图片火星了%s火星%d次%s了！", labelStart, count, labelEnd)
-	case count == 3:
-		return fmt.Sprintf("您这一组图片已经%s火星了%d次%s了，现在本车送你 ”火星之王“ 称号！", labelStart, count, labelEnd)
-	default:
-		return fmt.Sprintf("火星之王，收了你的神通吧，这些图都让您%s火星%d次%s了！", labelStart, count, labelEnd)
-	}
-}
-
-func (a *App) reportStat(groupID int64, marsCount int64) {
-	if a.reportClient == nil || a.cfg.ReportStatUrl == "" {
+func reportStat(groupID int64, marsCount int64) {
+	if reportClient == nil || config.ReportStatUrl == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reportStatTimeout)
@@ -602,45 +522,37 @@ func (a *App) reportStat(groupID int64, marsCount int64) {
 		"group_id":   groupID,
 		"mars_count": marsCount,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.ReportStatUrl, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.ReportStatUrl, bytes.NewReader(body))
 	if err != nil {
-		a.log.Warn("build report request", zap.Error(err))
+		logger.Warn("build report request", zap.Error(err))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := a.reportClient.Do(req)
+	resp, err := reportClient.Do(req)
 	if err != nil {
-		a.log.Warn("report stat", zap.Error(err))
+		logger.Warn("report stat", zap.Error(err))
 		return
 	}
 	_ = resp.Body.Close()
 }
 
-func (a *App) handleAddPicWhitelistByCallback(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleAddPicWhitelistByCallback(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.CallbackQuery == nil || ctx.EffectiveChat == nil {
 		return nil
 	}
-	parts := strings.SplitN(ctx.CallbackQuery.Data, ":", 2)
-	if len(parts) != 2 {
-		_, err := ctx.CallbackQuery.Answer(b, nil)
-		return err
-	}
-	dhash, err := hex.DecodeString(parts[1])
+	dhash, err := parseCallback(ctx.CallbackQuery.Data)
 	if err != nil {
-		_, ansErr := ctx.CallbackQuery.Answer(b, nil)
-		if ansErr != nil {
-			return ansErr
-		}
+		_, err = ctx.CallbackQuery.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: err.Error()})
 		return err
 	}
-	if err := a.queries.SetMarsWhitelist(context.Background(), ctx.EffectiveChat.Id, dhash, 1); err != nil {
+	if err := queries.SetMarsWhitelist(context.Background(), ctx.EffectiveChat.Id, dhash, 1); err != nil {
 		return err
 	}
 	_, err = ctx.CallbackQuery.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "该图片已加入白名单"})
 	return err
 }
 
-func (a *App) handlePicInfo(b *gotgbot.Bot, ctx *ext.Context) error {
+func handlePicInfo(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
 	if msg == nil || ctx.EffectiveChat == nil {
 		return nil
@@ -652,11 +564,11 @@ func (a *App) handlePicInfo(b *gotgbot.Bot, ctx *ext.Context) error {
 		return err
 	}
 
-	dhash, err := a.getDHash(context.Background(), b, *photo)
+	dhash, err := getDHash(context.Background(), b, *photo)
 	if err != nil {
 		return err
 	}
-	info, err := a.queries.GetMarsInfo(context.Background(), ctx.EffectiveChat.Id, dhash)
+	info, err := queries.GetMarsInfo(context.Background(), ctx.EffectiveChat.Id, dhash)
 	if errors.Is(err, sql.ErrNoRows) {
 		info = q.MarsInfo{GroupID: ctx.EffectiveChat.Id, PicDhash: dhash, Count: 0, LastMsgID: 0, InWhitelist: 0}
 	} else if err != nil {
@@ -683,15 +595,15 @@ func (a *App) handlePicInfo(b *gotgbot.Bot, ctx *ext.Context) error {
 	return err
 }
 
-func (a *App) handleAddToWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
-	return a.updateWhitelistForPhoto(b, ctx, true)
+func handleAddToWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
+	return updateWhitelistForPhoto(b, ctx, true)
 }
 
-func (a *App) handleRemoveFromWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
-	return a.updateWhitelistForPhoto(b, ctx, false)
+func handleRemoveFromWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
+	return updateWhitelistForPhoto(b, ctx, false)
 }
 
-func (a *App) updateWhitelistForPhoto(b *gotgbot.Bot, ctx *ext.Context, toWhitelist bool) error {
+func updateWhitelistForPhoto(b *gotgbot.Bot, ctx *ext.Context, toWhitelist bool) error {
 	msg := ctx.EffectiveMessage
 	if msg == nil || ctx.EffectiveChat == nil || b == nil {
 		return nil
@@ -702,11 +614,11 @@ func (a *App) updateWhitelistForPhoto(b *gotgbot.Bot, ctx *ext.Context, toWhitel
 			&gotgbot.SendMessageOpts{ReplyParameters: replyTo(msg.MessageId)})
 		return err
 	}
-	dhash, err := a.getDHash(context.Background(), b, *photo)
+	dhash, err := getDHash(context.Background(), b, *photo)
 	if err != nil {
 		return err
 	}
-	info, err := a.queries.GetMarsInfo(context.Background(), ctx.EffectiveChat.Id, dhash)
+	info, err := queries.GetMarsInfo(context.Background(), ctx.EffectiveChat.Id, dhash)
 	if errors.Is(err, sql.ErrNoRows) {
 		info = q.MarsInfo{InWhitelist: 0}
 	} else if err != nil {
@@ -728,59 +640,61 @@ func (a *App) updateWhitelistForPhoto(b *gotgbot.Bot, ctx *ext.Context, toWhitel
 		flag = 1
 		successMsg = "成功将图片加入白名单"
 	}
-	if err := a.queries.SetMarsWhitelist(context.Background(), ctx.EffectiveChat.Id, dhash, flag); err != nil {
+	if err := queries.SetMarsWhitelist(context.Background(), ctx.EffectiveChat.Id, dhash, flag); err != nil {
 		return err
 	}
 	_, err = b.SendMessage(ctx.EffectiveChat.Id, successMsg, &gotgbot.SendMessageOpts{ReplyParameters: replyTo(msg.MessageId)})
 	return err
 }
 
-func (a *App) handleAddUserToWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleAddUserToWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil || ctx.EffectiveUser == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
-	err := a.queries.AddUserToWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
+	err := queries.AddUserToWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
 	if err != nil {
 		var sqliteErr sqlite3.Error
 		if errors.As(err, &sqliteErr) && errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
-			_, sendErr := b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("用户 %s 已经在本群的白名单中，您发的任何图片都不会被处理。", userDisplayName(ctx.EffectiveUser)),
+			_, sendErr := b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("用户 %s 已经在本群的白名单中，您发的任何图片都不会被处理。", ctx.EffectiveMessage.GetSender().Name()),
 				&gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 			return sendErr
 		}
 		return err
 	}
-	_, err = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("已将用户 %s 加入白名单，您发的任何图片都不会被处理。", userDisplayName(ctx.EffectiveUser)),
+	name := ctx.EffectiveMessage.GetSender().Name()
+	_, err = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("已将用户 %s 加入白名单，您发的任何图片都不会被处理。", name),
 		&gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 	return err
 }
 
-func (a *App) handleRemoveUserFromWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleRemoveUserFromWhitelist(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil || ctx.EffectiveUser == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
-	err := a.queries.DeleteUserFromWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
+	err := queries.DeleteUserFromWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
 	if err != nil {
 		return err
 	}
-	_, err = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("已将用户 %s 移除本群白名单，火星车会继续为您服务。", userDisplayName(ctx.EffectiveUser)),
+	_, err = b.SendMessage(ctx.EffectiveChat.Id, fmt.Sprintf("已将用户 %s 移除本群白名单，火星车会继续为您服务。",
+		ctx.EffectiveMessage.GetSender().Name()),
 		&gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 	return err
 }
 
-func (a *App) handleBotStat(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleBotStat(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil || ctx.EffectiveUser == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
 	start := time.Now()
-	groupCount, err := a.queries.CountGroups(context.Background())
+	groupCount, err := queries.CountGroups(context.Background())
 	if err != nil {
 		groupCount = 0
 	}
-	marsCount, err := a.queries.GetGroupMarsCount(context.Background(), ctx.EffectiveChat.Id)
+	marsCount, err := queries.GetGroupMarsCount(context.Background(), ctx.EffectiveChat.Id)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	inWhitelist, err := a.isUserInWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
+	inWhitelist, err := isUserInWhitelist(context.Background(), ctx.EffectiveChat.Id, ctx.EffectiveUser.Id)
 	if err != nil {
 		return err
 	}
@@ -795,12 +709,12 @@ func (a *App) handleBotStat(b *gotgbot.Bot, ctx *ext.Context) error {
 		"本群一共记录了 %d 张不同的图片\n"+
 		"本次统计共耗时 %s\n"+
 		"火星车与您同在",
-		groupCount, ctx.EffectiveChat.Id, userDisplayName(ctx.EffectiveUser), ctx.EffectiveUser.Id, exists, marsCount, duration),
+		groupCount, ctx.EffectiveChat.Id, ctx.EffectiveMessage.GetSender().Name(), ctx.EffectiveUser.Id, exists, marsCount, duration),
 		&gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 	return err
 }
 
-func (a *App) handleHelp(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleHelp(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
@@ -824,7 +738,7 @@ func (a *App) handleHelp(b *gotgbot.Bot, ctx *ext.Context) error {
 	return err
 }
 
-func (a *App) handleWelcome(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleWelcome(b *gotgbot.Bot, ctx *ext.Context) error {
 	update := ctx.MyChatMember
 	if update == nil || update.Chat.Type == "private" {
 		return nil
@@ -843,7 +757,7 @@ func (a *App) handleWelcome(b *gotgbot.Bot, ctx *ext.Context) error {
 	return nil
 }
 
-func (a *App) handleCmdWelcome(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleCmdWelcome(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil {
 		return nil
 	}
@@ -862,33 +776,33 @@ func sendWelcome(bot *gotgbot.Bot, chatID int64) error {
 	return err
 }
 
-func (a *App) handleExportData(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleExportData(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveChat == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
 	chatID := ctx.EffectiveChat.Id
 
-	a.exportMu.Lock()
-	state, ok := a.exporting[chatID]
+	exportMu.Lock()
+	state, ok := exporting[chatID]
 	if ok {
 		if state.running {
-			a.exportMu.Unlock()
+			exportMu.Unlock()
 			_, err := b.SendMessage(chatID, "当前正在导出数据，请稍候再试", &gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 			return err
 		}
-		a.exportMu.Unlock()
+		exportMu.Unlock()
 		_, err := b.SendMessage(chatID, "请不要短时间内重复导出，每次单个群组导出冷却时间为10分钟。", &gotgbot.SendMessageOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 		return err
 	}
 	state = &exportState{running: true}
-	a.exporting[chatID] = state
-	a.exportMu.Unlock()
+	exporting[chatID] = state
+	exportMu.Unlock()
 
-	filePath, err := a.exportChatData(chatID)
+	filePath, err := exportChatData(chatID)
 	if err != nil {
-		a.exportMu.Lock()
-		delete(a.exporting, chatID)
-		a.exportMu.Unlock()
+		exportMu.Lock()
+		delete(exporting, chatID)
+		exportMu.Unlock()
 		return err
 	}
 	defer os.Remove(filePath)
@@ -902,25 +816,25 @@ func (a *App) handleExportData(b *gotgbot.Bot, ctx *ext.Context) error {
 	_, err = b.SendDocument(chatID, gotgbot.InputFileByReader(filepath.Base(filePath), f),
 		&gotgbot.SendDocumentOpts{ReplyParameters: replyTo(ctx.EffectiveMessage.MessageId)})
 	if err != nil {
-		a.exportMu.Lock()
-		delete(a.exporting, chatID)
-		a.exportMu.Unlock()
+		exportMu.Lock()
+		delete(exporting, chatID)
+		exportMu.Unlock()
 		return err
 	}
 
-	a.exportMu.Lock()
+	exportMu.Lock()
 	state.running = false
 	state.timer = time.AfterFunc(exportCooldown, func() {
-		a.exportMu.Lock()
-		delete(a.exporting, chatID)
-		a.exportMu.Unlock()
+		exportMu.Lock()
+		delete(exporting, chatID)
+		exportMu.Unlock()
 	})
-	a.exportMu.Unlock()
+	exportMu.Unlock()
 	return nil
 }
 
-func (a *App) exportChatData(chatID int64) (string, error) {
-	rows, err := a.queries.ListMarsInfoByGroup(context.Background(), chatID)
+func exportChatData(chatID int64) (string, error) {
+	rows, err := queries.ListMarsInfoByGroup(context.Background(), chatID)
 	if err != nil {
 		return "", err
 	}
@@ -952,7 +866,7 @@ func (a *App) exportChatData(chatID int64) (string, error) {
 	return filename, nil
 }
 
-func (a *App) handleExportHelp(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleExportHelp(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.EffectiveMessage == nil || ctx.EffectiveChat == nil {
 		return nil
 	}
@@ -961,26 +875,18 @@ func (a *App) handleExportHelp(b *gotgbot.Bot, ctx *ext.Context) error {
 	return err
 }
 
-func (a *App) handleFindSimilarByCallback(b *gotgbot.Bot, ctx *ext.Context) error {
+func handleFindSimilarByCallback(b *gotgbot.Bot, ctx *ext.Context) error {
 	if ctx.CallbackQuery == nil || ctx.EffectiveChat == nil || ctx.EffectiveMessage == nil {
 		return nil
 	}
-	parts := strings.SplitN(ctx.CallbackQuery.Data, ":", 2)
-	if len(parts) != 2 {
-		_, err := ctx.CallbackQuery.Answer(b, nil)
-		return err
-	}
-	target, err := hex.DecodeString(parts[1])
+	target, err := parseCallback(ctx.CallbackQuery.Data)
 	if err != nil {
-		_, ansErr := ctx.CallbackQuery.Answer(b, nil)
-		if ansErr != nil {
-			return ansErr
-		}
+		_, err = ctx.CallbackQuery.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: err.Error()})
 		return err
 	}
 
 	start := time.Now()
-	items, err := a.queries.ListSimilarPhotos(context.Background(), target, ctx.EffectiveChat.Id, similarHDThreshold)
+	items, err := queries.ListSimilarPhotos(context.Background(), target, ctx.EffectiveChat.Id, similarHDThreshold)
 	if err != nil {
 		return err
 	}
@@ -1003,47 +909,10 @@ func (a *App) handleFindSimilarByCallback(b *gotgbot.Bot, ctx *ext.Context) erro
 	return err
 }
 
-func getReferPhoto(msg *gotgbot.Message) *gotgbot.PhotoSize {
-	if msg == nil {
-		return nil
+func parseCallback(s string) ([]byte, error) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return nil, errors.New("not valid callback")
 	}
-	if len(msg.Photo) > 0 {
-		return &msg.Photo[len(msg.Photo)-1]
-	}
-	if msg.ReplyToMessage != nil && len(msg.ReplyToMessage.Photo) > 0 {
-		return &msg.ReplyToMessage.Photo[len(msg.ReplyToMessage.Photo)-1]
-	}
-	return nil
-}
-
-func userDisplayName(u *gotgbot.User) string {
-	if u == nil {
-		return ""
-	}
-	name := strings.TrimSpace(u.FirstName + " " + u.LastName)
-	if name != "" {
-		return name
-	}
-	if u.Username != "" {
-		return u.Username
-	}
-	return fmt.Sprintf("%d", u.Id)
-}
-
-func replyTo(messageID int64) *gotgbot.ReplyParameters {
-	if messageID == 0 {
-		return nil
-	}
-	return &gotgbot.ReplyParameters{MessageId: messageID}
-}
-
-func hammingDistance(a, b []byte) (int64, error) {
-	if len(a) != len(b) {
-		return 0, fmt.Errorf("%s: %d vs %d", hammingDistanceError, len(a), len(b))
-	}
-	var dist int64
-	for i := range a {
-		dist += int64(bits.OnesCount8(a[i] ^ b[i]))
-	}
-	return dist, nil
+	return hex.DecodeString(parts[1])
 }
