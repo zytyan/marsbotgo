@@ -43,6 +43,7 @@ type Config struct {
 	BotBaseFileUrl string   `env:"BOT_BASE_FILE_URL"`
 	BotProxy       *url.URL `env:"BOT_PROXY"`
 
+	NoBackup        bool   `env:"NO_BACKUP"`
 	S3ApiEndpoint   string `env:"S3_API_ENDPOINT"`
 	S3ApiKeyID      string `env:"S3_API_KEY_ID"`
 	S3ApiKeySecret  string `env:"S3_API_KEY_SECRET"`
@@ -107,6 +108,7 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync()
+	go StartBackupThread()
 
 	mediaGroups = make(map[string]chan *gotgbot.Message)
 	exporting = make(map[int64]*exportState)
