@@ -67,7 +67,7 @@ const (
 	reportRequestTimeout = 10 * time.Second
 	reportStatTimeout    = 5 * time.Second
 
-	hammdistSOName = "hammdist_c/libhammdist.so"
+	hammdistSOName = "libhammdist"
 )
 
 var (
@@ -182,9 +182,14 @@ func buildLogger(level string) (*zap.Logger, error) {
 
 func registerSQLiteDriver() {
 	registerSQLiteOnce.Do(func() {
+		f, err := os.Executable()
+		hammdistSOFile := hammdistSOName
+		if err == nil {
+			hammdistSOFile = filepath.Join(filepath.Dir(f), hammdistSOName)
+		}
 		sql.Register(sqliteDriverName, &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				err := conn.LoadExtension(hammdistSOName, "sqlite3_hammdist_init")
+				err := conn.LoadExtension(hammdistSOFile, "sqlite3_hammdist_init")
 				if err == nil {
 					fmt.Println("hammdist.so loaded")
 					return nil
