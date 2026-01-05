@@ -41,8 +41,8 @@ func StartBackupThread() {
 		if err := BackupAndUpload(context.Background()); err != nil && logger != nil {
 			logger.Warn("backup failed", zap.Error(err))
 		}
+		timer := time.NewTimer(interval)
 		for {
-			timer := time.NewTimer(interval)
 			select {
 			case <-backupStopCh:
 				timer.Stop()

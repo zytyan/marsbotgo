@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -49,6 +50,8 @@ type Config struct {
 	S3ApiKeySecret  string `env:"S3_API_KEY_SECRET"`
 	S3Bucket        string `env:"S3_BUCKET"`
 	S3BackupMinutes int    `env:"BACKUP_INTERVAL_MINUTES" envDefault:"2880"`
+
+	PprofAddr string `env:"PPROF_ADDR" envDefault:"localhost:4025"`
 
 	DevMode bool `env:"DEV_MODE" envDefault:"false"`
 }
@@ -108,6 +111,7 @@ func main() {
 		panic(err)
 	}
 	defer logger.Sync()
+	startPprof(config.PprofAddr)
 	go StartBackupThread()
 
 	mediaGroups = make(map[string]chan *gotgbot.Message)
@@ -180,6 +184,37 @@ func buildLogger(level string) (*zap.Logger, error) {
 		cfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
 	return cfg.Build()
+}
+
+func startPprof(addr string) {
+	if addr == "" {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+	mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+	mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+	mux.Handle("/debug/pprof/block", pprof.Handler("block"))
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if logger != nil {
+				logger.Warn("pprof server stopped", zap.Error(err))
+			} else {
+				fmt.Println("pprof server stopped: " + err.Error())
+			}
+		}
+	}()
 }
 
 func registerSQLiteDriver() {
