@@ -245,10 +245,13 @@ func initDB() error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=OFF;",
-		"PRAGMA cache_size=-80000;",
 		"PRAGMA busy_timeout=5000;",
 	}
 	for _, p := range pragmas {
