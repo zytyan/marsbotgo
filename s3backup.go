@@ -70,6 +70,7 @@ func BackupAndUpload(ctx context.Context) error {
 	if err := ensureS3Configured(); err != nil {
 		return err
 	}
+	defer C.malloc_trim(0)
 	ts := time.Now().Format("2006-01-02-15_04_05")
 	backupName := fmt.Sprintf("backup_mars_at_%s.db", ts)
 	backupPath := filepath.Join(os.TempDir(), backupName)
@@ -110,7 +111,6 @@ func backupWithSQLiteAPI(ctx context.Context, destPath string) error {
 	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove existing backup: %w", err)
 	}
-	defer C.malloc_trim(0)
 	destDB, err := sql.Open(sqliteDriverName, destPath)
 	if err != nil {
 		return fmt.Errorf("open destination db: %w", err)
