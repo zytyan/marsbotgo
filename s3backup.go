@@ -1,5 +1,11 @@
 package main
 
+/*
+#include <stdint.h>
+int malloc_trim(size_t sz);
+*/
+import "C"
+
 import (
 	"context"
 	"database/sql"
@@ -9,7 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/DataDog/zstd"
 	"github.com/mattn/go-sqlite3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -41,7 +47,7 @@ func StartBackupThread() {
 		if err := BackupAndUpload(context.Background()); err != nil && logger != nil {
 			logger.Warn("backup failed", zap.Error(err))
 		}
-		timer := time.NewTimer(interval)
+		timer := time.NewTicker(interval)
 		for {
 			select {
 			case <-backupStopCh:
@@ -52,7 +58,6 @@ func StartBackupThread() {
 					logger.Warn("backup failed", zap.Error(err))
 				}
 			}
-			timer.Reset(interval)
 		}
 	}()
 }
@@ -105,7 +110,7 @@ func backupWithSQLiteAPI(ctx context.Context, destPath string) error {
 	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove existing backup: %w", err)
 	}
-
+	defer C.malloc_trim(0)
 	destDB, err := sql.Open(sqliteDriverName, destPath)
 	if err != nil {
 		return fmt.Errorf("open destination db: %w", err)
@@ -178,10 +183,7 @@ func zstdFile(path string) (string, error) {
 	}
 	defer out.Close()
 
-	encoder, err := zstd.NewWriter(out, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-	if err != nil {
-		return "", err
-	}
+	encoder := zstd.NewWriterLevel(out, 15)
 	if _, err = io.Copy(encoder, in); err != nil {
 		_ = encoder.Close()
 		return "", err
