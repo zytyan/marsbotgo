@@ -1,4 +1,4 @@
-package main
+package marsbot
 
 import (
 	"bytes"
@@ -29,8 +29,8 @@ import (
 	"github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 
-	"main/minicv"
-	"main/q"
+	"marsbot/minicv"
+	"marsbot/q"
 )
 
 type Config struct {
@@ -59,7 +59,7 @@ type Config struct {
 var config Config
 
 const (
-	sqliteDriverName           = "marsbot_sqlite"
+	sqliteDriverName           = "marsbot_sqlite3"
 	groupedMediaWait           = 1 * time.Second
 	mediaGroupLimit            = 10
 	similarHDThreshold   int64 = 6
@@ -100,7 +100,7 @@ type exportState struct {
 	timer   *time.Timer
 }
 
-func main() {
+func Start() {
 	if err := env.Parse(&config); err != nil {
 		fmt.Println(err.Error())
 		os.Exit(2)
@@ -217,16 +217,11 @@ func startPprof(addr string) {
 	}()
 }
 
-func registerSQLiteDriver() {
+func registerSQLiteDriver(soFile string) {
 	registerSQLiteOnce.Do(func() {
-		f, err := os.Executable()
-		hammdistSOFile := hammdistSOName
-		if err == nil {
-			hammdistSOFile = filepath.Join(filepath.Dir(f), hammdistSOName)
-		}
 		sql.Register(sqliteDriverName, &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				err := conn.LoadExtension(hammdistSOFile, "sqlite3_hammdist_init")
+				err := conn.LoadExtension(soFile, "sqlite3_hammdist_init")
 				if err == nil {
 					fmt.Println("hammdist.so loaded")
 					return nil
@@ -237,10 +232,12 @@ func registerSQLiteDriver() {
 		})
 	})
 }
-
 func initDB() error {
-	registerSQLiteDriver()
-	var err error
+	f, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get executable path: %w", err)
+	}
+	registerSQLiteDriver(filepath.Join(filepath.Dir(f), hammdistSOName))
 	db, err = sql.Open(sqliteDriverName, config.DbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)

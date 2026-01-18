@@ -1,4 +1,4 @@
-package main
+package marsbot
 
 import (
 	"fmt"

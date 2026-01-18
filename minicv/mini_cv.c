@@ -5,10 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_STDIO
-#include "stb_image.h"
-
 struct mini_decimate_alpha {
     int si;
     int di;
@@ -282,7 +278,10 @@ static int mini_resize_area_linear(const uint8_t* src, int src_w, int src_h, int
 
     for (int dy = 0; dy < dst_h; ++dy) {
         const uint8_t* srow0 = src + yofs[dy] * src_stride;
-        const uint8_t* srow1 = src + (yofs[dy] + 1) * src_stride;
+        const uint8_t* srow1 = srow0;
+        if (src_h > 1) {
+            srow1 = src + (yofs[dy] + 1) * src_stride;
+        }
         uint8_t* drow = dst + dy * dst_stride;
         int wy0 = beta[dy * 2];
         int wy1 = beta[dy * 2 + 1];
@@ -431,41 +430,35 @@ static void mini_pack_dhash_bits(const uint8_t* img, int width, uint8_t* out_has
     }
 }
 
-int mini_dhash_from_bytes(const uint8_t* data, size_t len, uint8_t* out_hash) {
-    if (!data || !out_hash || len == 0 || len > (size_t)INT_MAX) return -1;
+int mini_dhash_from_raw(const uint8_t* raw, int width, int height, int stride, uint8_t* out_hash, mini_color_code code) {
+    if (!raw || !out_hash || width <= 0 || height <= 0 || stride <= 0) return -1;
+    if (width > INT_MAX / 4 || height > INT_MAX) return -2;
+    if (stride < width) return -3;
+    const uint8_t* gray = NULL;
+    if (code == MINI_NO_CHANGE) {
+        gray = raw;
+    } else {
+        size_t gray_size = (size_t)(width > stride ? width : stride) * (size_t)height;
+        if (gray_size == 0) {
+            return -4;
+        }
+        uint8_t* converted_gray = (uint8_t*)malloc(gray_size);
+        if (!converted_gray) {
+            return -5;
+        }
 
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    uint8_t* rgba = stbi_load_from_memory(data, (int)len, &width, &height, &channels, 4);
-    if (!rgba) return -2;
-    if (width <= 0 || height <= 0 || (size_t)width * 4 > (size_t)INT_MAX) {
-        stbi_image_free(rgba);
-        return -3;
+        int rc = mini_cvtcolor_u8(raw, width, height, stride, 4, converted_gray, stride, 1, code);
+        if (rc != 0) {
+            free(converted_gray);
+            return rc;
+        }
+        gray = (const uint8_t*)converted_gray;
     }
-
-    size_t gray_size = (size_t)width * (size_t)height;
-    if (gray_size == 0) {
-        stbi_image_free(rgba);
-        return -3;
-    }
-    uint8_t* gray = (uint8_t*)malloc(gray_size);
-    if (!gray) {
-        stbi_image_free(rgba);
-        return -4;
-    }
-
-    int rc = mini_cvtcolor_u8(rgba, width, height, width * 4, 4, gray, width, 1, MINI_RGBA2GRAY);
-    if (rc != 0) {
-        free(gray);
-        stbi_image_free(rgba);
-        return rc;
-    }
-
     uint8_t resized[8 * 9];
-    rc = mini_resize_area_u8(gray, width, height, width, 1, resized, 9, 8, 9);
-    free(gray);
-    stbi_image_free(rgba);
+    int rc = mini_resize_area_u8(gray, width, height, stride, 1, resized, 9, 8, 9);
+    if (gray != raw) {
+        free((void*)gray);
+    }
     if (rc != 0) return rc;
 
     mini_pack_dhash_bits(resized, 9, out_hash);

@@ -15,7 +15,8 @@ typedef enum {
     MINI_GRAY2RGB = 3,
     MINI_BGR2RGB = 4,
     MINI_RGB2BGR = 5,
-    MINI_RGBA2GRAY = 6
+    MINI_RGBA2GRAY = 6,
+    MINI_NO_CHANGE = 7,
 } mini_color_code;
 
 int mini_cvtcolor_u8(const uint8_t* src, int width, int height, int src_stride,
@@ -25,7 +26,7 @@ int mini_cvtcolor_u8(const uint8_t* src, int width, int height, int src_stride,
 int mini_resize_area_u8(const uint8_t* src, int src_w, int src_h, int src_stride,
                         int channels, uint8_t* dst, int dst_w, int dst_h, int dst_stride);
 
-int mini_dhash_from_bytes(const uint8_t* data, size_t len, uint8_t* out_hash);
+int mini_dhash_from_raw(const uint8_t* raw, int width, int height, int stride, uint8_t* out_hash, mini_color_code code);
 
 #ifdef __cplusplus
 }

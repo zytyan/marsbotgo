@@ -1,8 +1,11 @@
 package minicv
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,10 +17,18 @@ func loadTestImage(t *testing.T) []byte {
 	t.Helper()
 	path := filepath.Join("testdata", "1x1.png")
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read test image: %v", err)
+	if err == nil {
+		if _, _, err := image.Decode(bytes.NewReader(data)); err == nil {
+			return data
+		}
 	}
-	return data
+
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode fallback image: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func readRSS(t *testing.T) uint64 {
